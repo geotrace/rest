@@ -2,43 +2,40 @@ package rest
 
 import (
 	"bytes"
-	"compress/gzip"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
-)
 
-// JSON позволяет быстро описать данные в одноименном формате.
-type JSON map[string]interface{}
+	"github.com/klauspost/compress/gzip"
+)
 
 var (
 	// Взведенный флаг Debug указывает, что описания ошибок возвращаются как
 	// есть. В противном случае всегда возвращается только стандартное описание
 	// статуса HTTP, сформированное на базе этой ошибки.
 	Debug bool = false
-	// MaxBody описывает максимальный размер поддерживаемого запроса.
-	// Если размер превышает указанный, то возвращается ошибка. Если не хочется
-	// ограничений, то можно установить значение 0, тогда проверка производиться
-	// не будет.
-	MaxBody int64 = 1 << 15 // 32 мегабайта
 	// Флаг Compress разрешает сжатие данных. Чтобы запретить сжимать данные,
 	// установите значение данного флага в false. При инициализации сжатия
 	// проверяется, что оно уже не включено, например, на уровне глобального
 	// обработчика запросов и, в этом случае, сжатие не будет включено, даже
 	// если флаг установлен.
 	Compress bool = true
-	// JSONError управляет форматом вывода ошибок: если флаг не взведен, то
+	// Encoder описывает функции, используемые для разбора запроса и кодирования
+	// ответа. MaxBody задает максимальный размер поддерживаемого запроса.
+	// Если размер превышает указанный, то возвращается ошибка. Если не хочется
+	// ограничений, то можно установить значение 0, тогда проверка производиться
+	// не будет.
+	Encoder Coder = NewJSONCoder(1 << 15) // 32 мегабайта
+	// EncodeError управляет форматом вывода ошибок: если флаг не взведен, то
 	// ошибки отдаются как текст. В противном случае описание ошибок
-	// возвращается в виде JSON, в котором содержится статус и описание ошибки.
-	JSONError bool = true
+	// кодируются с помощью Encoder и содержат статус и описание ошибки.
+	EncodeError bool = true
 )
 
 // Context содержит контекстную информацию HTTP-запроса и методы формирования
@@ -67,6 +64,7 @@ type Context struct {
 
 	response http.ResponseWriter         // ответ на запрос
 	params   []param                     // именованные параметры из пути запроса
+	path     string                      // путь запроса
 	status   int                         // код HTTP-ответа
 	sended   bool                        // флаг отосланного ответа
 	query    url.Values                  // параметры запроса в URL (кеш)
@@ -85,6 +83,7 @@ func newContext(w http.ResponseWriter, r *http.Request) *Context {
 	c.Request = r
 	c.ContentType = ""
 	c.response = w
+	c.path = r.URL.Path
 	c.params = nil
 	c.status = 0
 	c.sended = false
@@ -245,40 +244,10 @@ func (c *Context) SetData(key, value interface{}) {
 	c.data[key] = value
 }
 
-// Bind разбирает данные запроса в формате JSON и заполняет ими указанный в
-// параметре объект.
-//
-// Если Content-Type запроса не соответствует "application/json", то
-// возвращается ошибка ErrUnsupportedMediaType. Так же может возвращать ошибку
-// ErrLengthRequired, если не указана длина запроса, ErrRequestEntityTooLarge —
-// если запрос превышает значение MaxBody, и ErrBadRequest — если не смогли
-// разобрать запрос и поместить результат разбора в объект obj. Все эти ошибки
-// поддерживаются методом Send и отдают соответствующий статус ответа на запрос.
+// Bind разбирает данные запроса и заполняет ими указанный в параметре объект.
+// Разбор осуществляется с помощью Encoder.
 func (c *Context) Bind(obj interface{}) error {
-	// разбираем заголовок с типом информации в запросе
-	mediatype, params, _ := mime.ParseMediaType(
-		c.Request.Header.Get("Content-Type"))
-	charset, ok := params["charset"]
-	if !ok {
-		charset = "UTF-8"
-	}
-	// если запрос не является JSON, то возвращаем ошибку
-	if mediatype != "application/json" || strings.ToUpper(charset) != "UTF-8" {
-		return ErrUnsupportedMediaType
-	}
-	// если запрос превышает допустимый объем, то возвращаем ошибку
-	if MaxBody > 0 {
-		if c.Request.ContentLength == 0 {
-			return ErrLengthRequired
-		} else if c.Request.ContentLength > MaxBody {
-			return ErrRequestEntityTooLarge
-		}
-	}
-	// разбираем данные из запроса
-	if err := json.NewDecoder(c.Request.Body).Decode(obj); err != nil {
-		return ErrBadRequest
-	}
-	return nil
+	return Encoder.Bind(c, obj)
 }
 
 // Эти ошибки обрабатываются при передаче их в метод Context.Send и
@@ -332,11 +301,8 @@ func (c *Context) Send(data interface{}) (err error) {
 		_, err = c.Write(data)
 	case io.Reader:
 		_, err = io.Copy(c, data)
-	default: // кодируем как JSON
-		if c.ContentType == "" {
-			c.ContentType = "application/json; charset=utf-8"
-		}
-		err = json.NewEncoder(c).Encode(data)
+	default: // кодируем как объект
+		err = Encoder.Encode(c, data)
 	}
 	// если в процессе отправки произошла ошибка, но мы еще ничего не отправили,
 	// то отдаем ошибку
@@ -380,9 +346,8 @@ func (c *Context) Send(data interface{}) (err error) {
 			msg = http.StatusText(c.status)
 		}
 		// В зависимости от флага, ошибку выводим как JSON или как текст
-		if JSONError {
-			c.ContentType = "application/json; charset=utf-8"
-			err = json.NewEncoder(c).Encode(JSON{"code": c.status, "error": msg})
+		if EncodeError {
+			err = Encoder.Encode(c, JSON{"code": c.status, "error": msg})
 		} else {
 			c.ContentType = "text/plain; charset=utf-8"
 			_, err = fmt.Fprint(c, msg)
@@ -392,14 +357,13 @@ func (c *Context) Send(data interface{}) (err error) {
 }
 
 // Error отправляет указанный текст как описание ошибки. В зависимости от
-// флага JSONError, данный текст будет отдан как описание или как JSON с кодом
+// флага EncodeError, данный текст будет отдан как описание или как JSON с кодом
 // статуса. В отличии от обычных ошибок, на данный текст не распространяется
 // правило отладки и текст будет отдан в неизменном виде, в не зависимости от
 // установленного значения Debug.
 func (c *Context) Error(code int, msg string) error {
 	c.Status(code) // устанавливаем код ответа
-	if JSONError {
-		c.ContentType = "application/json; charset=utf-8"
+	if EncodeError {
 		return c.Send(JSON{"code": c.status, "error": msg})
 	}
 	c.ContentType = "text/plain; charset=utf-8"

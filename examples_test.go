@@ -6,8 +6,13 @@ import (
 	"os"
 	"time"
 
-	"github.com/geotrace/rest"
+	"github.com/mdigger/rest"
 )
+
+func init() {
+	rest.SetLogger(os.Stderr)
+	rest.Debug = true
+}
 
 func Example() {
 	var mux rest.ServeMux // инициализируем обработчик запросов

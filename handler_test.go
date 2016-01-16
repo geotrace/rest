@@ -4,8 +4,14 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 )
+
+func init() {
+	SetLogger(os.Stderr)
+	Debug = true
+}
 
 func TestHandlerWithError(t *testing.T) {
 	ts := httptest.NewServer(Handlers(Handler(func(c *Context) error {

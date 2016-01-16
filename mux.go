@@ -2,8 +2,6 @@ package rest
 
 import (
 	"net/http"
-	"reflect"
-	"runtime"
 	"strings"
 )
 
@@ -22,11 +20,6 @@ type ServeMux struct {
 // ServeHTTP обеспечивает поддержку интерфейса http.Handler. Таким образом,
 // данный ServeMux можно использовать как стандартный обработчик HTTP-запросов.
 //
-// Если обработчик для данного пути и метода не найден, но есть обработчики
-// для других методов, то возвращается статус http.StatusMethodNotAllowed и в
-// заголовке передается список методов, которые можно применить к данному пути.
-// В противном случае возвращается статус http.StatusNotFound.
-//
 // В процессе обработки запроса отслеживаются возвращаемые ошибки и
 // перехватываются возможные вызовы panic. Если ответ на запрос еще не
 // отправлялся, то в этих случаях в ответ будет отправлена ошибка.
@@ -39,11 +32,30 @@ func (m ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			c.Send(e)
 			// выводим дамп с ошибкой
 			if accessLog != nil {
-				c.errorLog(e, true) // записываем ошибку в лог
+				c.errorLog(e, 2) // записываем ошибку в лог
 			}
 		}
 		c.close() // освобождаем по окончании
 	}()
+	// вызываем обработку запроаса
+	if err := m.Handler(c); err != nil {
+		if accessLog != nil {
+			c.errorLog(err, 1) // записываем ошибку в лог
+		}
+		// если ничего не отправляли, то отправляем эту ошибку
+		if !c.sended {
+			c.Send(err) // возвращаемые ошибки игнорируем
+		}
+	}
+}
+
+// Handler отвечает за подбор обработчика и его выполнение.
+//
+// Если обработчик для данного пути и метода не найден, но есть обработчики
+// для других методов, то возвращается статус http.StatusMethodNotAllowed и в
+// заголовке передается список методов, которые можно применить к данному пути.
+// В противном случае возвращается статус http.StatusNotFound.
+func (m ServeMux) Handler(c *Context) error {
 	// добавляем заголовки, если они определены
 	header := c.response.Header()
 	if len(m.Headers) > 0 {
@@ -51,45 +63,28 @@ func (m ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			header.Set(key, value)
 		}
 	}
-	path := r.URL.Path // путь запроса
 	// если задан базовый путь, то удаляем его из пути обработки
 	if m.BasePath != "" {
 		// проверяем, что путь начинается с базового пути
-		if !strings.HasPrefix(path, m.BasePath) {
-			c.Send(ErrNotFound)
-			return
+		if !strings.HasPrefix(c.path, m.BasePath) {
+			return c.Send(ErrNotFound)
 		}
-		path = strings.TrimPrefix(path, m.BasePath)
+		c.path = strings.TrimPrefix(c.path, m.BasePath)
 	}
 	// получаем список обработчиков для данного метода
-	routers := m.routers[r.Method]
+	routers := m.routers[c.Request.Method]
 	// запрашиваем подходящий обработчик
-	if handler, params := routers.lookup(path); handler != nil {
-		c.params = params // добавляем найденные параметры к контексту
-		// если включен режим отладки, то добавляем в контекст имя функции
-		// с обработчиком запроса, которое будет использоваться при выводе
-		// лога
-		if Debug && accessLog != nil {
-			c.SetData(dataSet(137), // магическое число 137 с приватным типом
-				runtime.FuncForPC(reflect.ValueOf(handler).Pointer()).Name())
-		}
+	if handler, params := routers.lookup(c.path); handler != nil {
+		// добавляем найденные параметры к контексту
+		c.params = append(c.params, params...)
 		// вызываем обработчик запроса
-		if err := handler(c); err != nil {
-			if accessLog != nil {
-				c.errorLog(err, false) // записываем ошибку в лог
-			}
-			// если ничего не отправляли, то отправляем эту ошибку
-			if !c.sended {
-				c.Send(err) // возвращаемые ошибки игнорируем
-			}
-		}
-		return
+		return handler(c)
 	}
 	// обработчик для данного пути не найден
 	// собираем список методов, которые поддерживаются для данного пути
 	methods := make([]string, 0, len(m.routers))
 	for method, handlers := range m.routers {
-		if handler, _ := handlers.lookup(path); handler != nil {
+		if handler, _ := handlers.lookup(c.path); handler != nil {
 			methods = append(methods, method)
 		}
 	}
@@ -97,11 +92,10 @@ func (m ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// если есть обработчики для данного пути, но с другими методами,
 		// то отдаем этот список методов
 		header.Set("Allow", strings.Join(methods, ", "))
-		c.Status(http.StatusMethodNotAllowed).Send(nil)
-	} else {
-		// обработчики пути не определены ни для одного метода
-		c.Send(ErrNotFound)
+		return c.Status(http.StatusMethodNotAllowed).Send(nil)
 	}
+	// обработчики пути не определены ни для одного метода
+	return c.Send(ErrNotFound)
 }
 
 // Handle регистрирует обработчик для указанного метода и пути.
