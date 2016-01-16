@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mdigger/rest"
+	"github.com/geotrace/rest"
 )
 
 func TestCodex(t *testing.T) {

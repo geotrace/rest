@@ -4,8 +4,8 @@ import (
 	"mime"
 	"strings"
 
-	"github.com/mdigger/rest"
-	"github.com/mdigger/rest/httpaccept"
+	"github.com/geotrace/rest"
+	"github.com/geotrace/rest/httpaccept"
 	"github.com/ugorji/go/codec"
 )
 
