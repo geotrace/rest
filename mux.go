@@ -32,7 +32,7 @@ func (m ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			c.Send(e)
 			// выводим дамп с ошибкой
 			if accessLog != nil {
-				c.errorLog(e, 2) // записываем ошибку в лог
+				c.errorLog(e, 3) // записываем ошибку в лог
 			}
 		}
 		c.close() // освобождаем по окончании
